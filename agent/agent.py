@@ -10,7 +10,7 @@ import os
 
 from dotenv import load_dotenv
 from livekit import agents, rtc
-from livekit.agents import Agent, AgentSession
+from livekit.agents import Agent, AgentSession, JobExecutorType
 from livekit.plugins import synthesia
 from livekit.plugins import openai
 
@@ -68,5 +68,15 @@ async def entrypoint(ctx: agents.JobContext):
 
 if __name__ == "__main__":
     agents.cli.run_app(
-        agents.WorkerOptions(entrypoint_fnc=entrypoint, agent_name=AGENT_NAME)
+        agents.WorkerOptions(
+            entrypoint_fnc=entrypoint,
+            agent_name=AGENT_NAME,
+            # Hosts like Render health-check the port in $PORT, so serve on it.
+            # One avatar session at a time, so skip the pool of pre-warmed worker
+            # processes (4 by default in production) that needs well over 512 MB.
+            num_idle_processes=0,
+            job_executor_type=JobExecutorType.THREAD,
+            host="0.0.0.0",
+            **({"port": int(os.environ["PORT"])} if os.getenv("PORT") else {}),
+        )
     )

@@ -145,9 +145,10 @@ export default function Home() {
             ref={videoRef}
             autoPlay
             playsInline
-            className={`h-full w-full bg-black object-contain ${
-              connection === "live" ? "" : "hidden"
-            }`}
+            // Overlay the stage and toggle with inline style, so the placeholder
+            // layout never depends on the video's size or a utility class.
+            style={{ display: connection === "live" ? "block" : "none" }}
+            className="absolute inset-0 h-full w-full bg-black object-contain"
           />
           <audio ref={audioRef} autoPlay />
           {audioBlocked && connection === "live" && (
