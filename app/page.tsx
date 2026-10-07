@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Room, RoomEvent, Track, type RemoteTrack } from "livekit-client";
+import { AUDIO_STREAM_TOPIC, AVATAR_IDENTITY, TTS_SAMPLE_RATE } from "@/lib/livekit";
 
 type Turn = { role: "user" | "assistant"; text: string };
 
@@ -30,8 +31,9 @@ export default function Home() {
   const roomRef = useRef<Room | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
-
-  useEffect(() => () => void roomRef.current?.disconnect(), []);
+  const roomName = useRef<string | null>(null);
+  const liveRef = useRef(false);
+  const speakQueue = useRef<Promise<unknown>>(Promise.resolve());
 
   async function waitForReply(baselineAt: string | null) {
     let last = "";
@@ -51,19 +53,45 @@ export default function Home() {
     throw new Error("Humbot took too long to reply");
   }
 
+  function endAvatar() {
+    const room = roomRef.current;
+    roomRef.current = null;
+    liveRef.current = false;
+    room?.disconnect();
+    // Closing the room ends the Synthesia session and frees its slot.
+    if (roomName.current) {
+      navigator.sendBeacon("/api/avatar/end", JSON.stringify({ room: roomName.current }));
+      roomName.current = null;
+    }
+  }
+
+  useEffect(() => {
+    const leave = () => endAvatar();
+    window.addEventListener("pagehide", leave);
+    return () => {
+      window.removeEventListener("pagehide", leave);
+      leave();
+    };
+  }, []);
+
   async function connectAvatar() {
     setConnection("connecting");
+    setStatus("");
     try {
-      const { url, token } = await api<{ url: string; token: string }>(
-        "/api/livekit/token",
-        {},
-      );
+      const { url, token, room: name, identity } = await api<{
+        url: string;
+        token: string;
+        room: string;
+        identity: string;
+      }>("/api/livekit/token", {});
       // adaptiveStream off so the browser always pulls the avatar at full resolution.
       const room = new Room({ adaptiveStream: false });
       room.on(RoomEvent.TrackSubscribed, (track: RemoteTrack) => {
         if (track.kind === Track.Kind.Video && videoRef.current) {
           track.attach(videoRef.current);
+          liveRef.current = true;
           setConnection("live");
+          setStatus("");
         } else if (track.kind === Track.Kind.Audio && audioRef.current) {
           track.attach(audioRef.current);
         }
@@ -71,33 +99,76 @@ export default function Home() {
       room.on(RoomEvent.AudioPlaybackStatusChanged, () =>
         setAudioBlocked(!room.canPlaybackAudio),
       );
+      // The avatar reports playback progress to us over RPC; just acknowledge.
+      room.registerRpcMethod("lk.playback_started", async () => "ok");
+      room.registerRpcMethod("lk.playback_finished", async () => "ok");
       room.on(RoomEvent.Disconnected, () => setConnection("idle"));
       await room.connect(url, token);
       roomRef.current = room;
+      roomName.current = name;
       await room.startAudio().catch(() => setAudioBlocked(true));
-      // The agent should publish the avatar video within about a minute.
+
+      // Ask Synthesia to start the avatar in this room.
+      setStatus("Starting your avatar…");
+      await api("/api/avatar/session", { room: name, identity });
+
+      // The avatar should publish video within about a minute and a half.
       setTimeout(() => {
-        if (roomRef.current === room && !room.remoteParticipants.size) {
-          room.disconnect();
-          roomRef.current = null;
-          setStatus(
-            "The avatar agent didn't join. Make sure `python agent.py dev` is running, then try again.",
-          );
+        if (roomRef.current === room && !liveRef.current) {
+          endAvatar();
+          setConnection("idle");
+          setStatus("The avatar didn't start in time. Please try again.");
         }
-      }, 60_000);
+      }, 90_000);
     } catch (err) {
+      endAvatar();
       setConnection("idle");
       setStatus((err as Error).message);
     }
   }
 
-  async function speak(text: string) {
+  // Streams a spoken reply to the avatar: OpenAI speech (24 kHz mono PCM) is piped
+  // through a LiveKit byte stream that the avatar lip-syncs to.
+  async function speakNow(text: string) {
     const room = roomRef.current;
     if (!room) return;
-    await room.localParticipant.publishData(new TextEncoder().encode(text), {
-      reliable: true,
-      topic: "speak",
+    const res = await fetch("/api/tts", { method: "POST", body: JSON.stringify({ text }) });
+    if (!res.ok || !res.body) {
+      throw new Error((await res.json().catch(() => null))?.error ?? "Text-to-speech failed");
+    }
+    const writer = await room.localParticipant.streamBytes({
+      name: `AUDIO_${Date.now()}`,
+      topic: AUDIO_STREAM_TOPIC,
+      destinationIdentities: [AVATAR_IDENTITY],
+      attributes: { sample_rate: String(TTS_SAMPLE_RATE), num_channels: "1" },
     });
+    const reader = res.body.getReader();
+    let carry = new Uint8Array(0);
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        let bytes = new Uint8Array(carry.length + value.length);
+        bytes.set(carry);
+        bytes.set(value, carry.length);
+        // Keep samples whole: 16-bit PCM needs an even number of bytes.
+        const even = bytes.length - (bytes.length % 2);
+        carry = bytes.slice(even);
+        bytes = bytes.slice(0, even);
+        for (let i = 0; i < bytes.length; i += 9600) {
+          await writer.write(bytes.slice(i, i + 9600));
+        }
+      }
+    } finally {
+      await writer.close();
+    }
+  }
+
+  function speak(text: string) {
+    // One utterance at a time, in order.
+    const next = speakQueue.current.then(() => speakNow(text));
+    speakQueue.current = next.catch(() => {});
+    return next;
   }
 
   async function send(e: React.FormEvent) {
